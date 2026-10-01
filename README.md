@@ -1,2 +1,2 @@
 # Time-Travel-Debugger
-Implemented the classes for Stack and TimelineNode.
+Implemented the classes for Stack and Timeline.
