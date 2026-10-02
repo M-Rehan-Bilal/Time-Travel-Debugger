@@ -12,7 +12,6 @@
 #include <string>
 #include <cstdint>
 #include <fstream>
-#include <stdexcept>
 //#include <unistd.h>
 //#include <sys/socket.h>
 //#include <cstdint>
@@ -129,13 +128,11 @@ public:
 };
 
 // Core structs
-struct Variable
-{
+struct Variable {
     string name;
     int32_t value;
 };
-struct Frame
-{
+struct Frame {
     string func_name;
     int32_t argc;
     Variable argv[MAX_VARS_PER_FRAME];
@@ -143,56 +140,110 @@ struct Frame
     Variable locals[MAX_VARS_PER_FRAME];
     int32_t localCount;
 };
-struct Snapshot
-{
+struct Snapshot {
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
-struct TTDBHeader
-{
+struct TTDBHeader {
     char magic[4]; // "TTDB"
     int32_t version;
     int32_t stepCount;
     int64_t indexOffset;
 };
-void writeHeader(FILE *f, const TTDBHeader &h)
-{
+void writeHeader(FILE* f, const TTDBHeader& h) {
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
 
     // placeholder for other two data members
+    fwrite(&h.stepCount, sizeof(int32_t), 1, f);
+    fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
 }
 
 // resolve.bin - bookkeeping
-struct FuncEntry
-{
+struct FuncEntry {
     string funcName;
     int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
 };
-struct PendingPatch
-{
+struct PendingPatch {
     int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
     string targetFuncName;
 };
 
-
-
 // PASS 0x0: READING source.bin + VALIDITY CHECK
-bool readSourceLine(ifstream &in, string &out)
-{
+bool readSourceLine(ifstream& in, string& out) {
     // reads the next nonblank line
+    while (getline(in, out)) {
+        if (!out.empty())
+            return true;
+    }
+    return false;
 }
-string firstWord(const string &line)
-{
+string firstWord(const string& line) {
     // returns first word from the input string
+    string word = "";
+    for (int i = 0; i < line.size(); i++) {
+        if (line[i] == ' ')
+            break;
+        word += line[i];
+    }
+    return word;
 }
-string secondWord(const string &line)
-{
+string secondWord(const string& line) {
     // returns the second word
+    string word = "";
+    bool second = false;
+    for (int i = 0; i < line.size(); i++) {
+        if (line[i] == ' ') {
+            if (second)
+                break;
+            second = true;
+            word = "";
+        }
+        else {
+            word += line[i];
+        }
+    }
+    return word;
 }
-bool validateProgram(const char *sourcePath)
-{
+
+const int INSTRUCTIONS_COUNT = 8;
+const string instructionSet[INSTRUCTIONS_COUNT] = { "func", "func_end", "call", "set", "add", "mul", "sub", "div" };
+
+bool validateProgram(const char* sourcePath) {
     // for each func defined there should be exactly one func_end and no nested funcs allowed - 
+    ifstream rdr(sourcePath);
+    if (!rdr)
+        return false;
+    string line;
+    Stack<string> st;
+    bool isValidKeyword = false;
+    bool main = false;
+    while (readSourceLine(rdr, line)) {
+        string fWord = firstWord(line);
+        string sWord = secondWord(line);
+        if (fWord == "func") {
+            if (sWord == "" || !st.isEmpty())
+                return false;
+            st.push(fWord);
+            if (sWord == "main")
+                main = true;
+        }
+        else if (fWord == "func_end") {
+            if (st.isEmpty())
+                return false;
+            st.pop();
+        }
+        isValidKeyword = false;
+        for (int i = 0; i < INSTRUCTIONS_COUNT; i++) {
+            if (fWord == instructionSet[i]) {
+                isValidKeyword = true;
+                break;
+            }
+        }
+        if (!isValidKeyword)
+            return false;
+    }
+    return st.isEmpty() && main;
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
