@@ -247,17 +247,37 @@ bool validateProgram(const char* sourcePath) {
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
-int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
-{
+int64_t writeResolveRecord(FILE* f, int64_t offsetField, const string& text) {
     // writes one [offset(8B)][size(4B)][string] record at the current file position
     // returns this record's own starting byte position
+    int64_t startingBytePos = ftell(f);
+    fwrite(&offsetField, sizeof(int64_t), 1, f);
+    int32_t size = text.size();
+    fwrite(&size, sizeof(int32_t), 1, f);
+    fwrite(&text[0], sizeof(text), 1, f);
+    return startingBytePos;
 }
-int64_t readResolveRecord(FILE *f, string &outText)
-{
+
+int64_t readResolveRecord(FILE* f, string& outText) {
     // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+    int64_t startingBytePos;
+    if (fread(&startingBytePos, sizeof(int64_t), 1, f) != 1) {
+        return -1;
+    }
+    int32_t size;
+    if (fread(&size, sizeof(int32_t), 1, f) != 1) {
+        return -1;
+    }
+    if (size <= 0 || size > IO_BUFFER_SIZE) {
+        return -1; // corrupt size
+    }
+    outText.resize(size);
+    if (fread(&outText[0], size, 1, f) != 1) {
+        return -1;
+    }
+    return startingBytePos;
 }
-int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
-{
+int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
     FuncEntry funcArray[MAX_FUNCS];
     int32_t funcCount = 0;
     PendingPatch patches[MAX_PATCHES];
@@ -269,7 +289,73 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     // Once the whole file is written, every CALL's offset field is patched
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
-    // if there is no main return the error 
+    // if there is no main return the error
+    ifstream rdr(sourcePath);
+    if (!rdr)
+        return -1;
+    //ofstream fout(resolveBinPath, ios::binary);
+    FILE* fout = fopen(resolveBinPath, "wb");
+    if (!fout)
+        return -1;
+    string line;
+    int64_t offset = 0;
+    while (readSourceLine(rdr, line)) {
+        offset = writeResolveRecord(fout, offset, line);
+        string fWord = firstWord(line);
+        string sWord = secondWord(line);
+        if (fWord == "func") {
+            if (funcCount == MAX_FUNCS) {
+                fclose(fout);
+                rdr.close();
+                return -1;
+            }
+            funcArray[funcCount] = { sWord, offset };
+            funcCount++;
+        }
+        else if (fWord == "call") {
+            if (patchCount == MAX_PATCHES) {
+                fclose(fout);
+                rdr.close();
+                return -1;
+            }
+            patches[patchCount] = { offset, sWord };
+            patchCount++;
+        }
+        offset += sizeof(int64_t) + sizeof(int32_t) + line.size();
+    }
+    for (int i = 0; i < patchCount; i++) {
+        bool found = false;
+        for (int j = 0; j < funcCount; j++) {
+            if (patches[i].targetFuncName == funcArray[j].funcName) {
+                int64_t target = funcArray[j].byteOffsetInResolveBin;
+                if (fseek(fout, patches[i].byteOffsetOfOffsetField, SEEK_SET) != 0) {
+                    fclose(fout);
+                    rdr.close();
+                    return -1;
+                }
+                if (fwrite(&target, sizeof(int64_t), 1, fout) != 1) {
+                    fclose(fout);
+                    rdr.close();
+                    return -1;
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            fclose(fout);
+            rdr.close();
+            return -1;
+        }
+    }
+    fclose(fout);
+    rdr.close();
+    for (int i = 0; i < funcCount; i++) {
+        if (funcArray[i].funcName == "main") {
+            return funcArray[i].byteOffsetInResolveBin;
+        }
+    }
+    return -1;
 }
 
 // PASS 0x2: EXECUTION (tokenization happens here)
