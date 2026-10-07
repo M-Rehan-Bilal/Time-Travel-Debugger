@@ -12,3 +12,8 @@ Implemented the function for reading Source.bin, line-by-line. The Validation fu
 Stage 2: Pass 0x1: Resolve
 Implemented the function to write Resolved Record in resolve.bin following the given format of [offset(8B)][size(4B)][string], along with the function that reads the Resolved Record from resolve.bin.
 Implemented the function of resolving the program that mainly reads the source.bin file, writes the resolved record in the resolve.bin by following the format specified, and at the end replaces the function call lines offset with the actual offsets where the function exists in the resolve.bin.
+
+[October 7, 2026]
+Stage 3: Pass 0x2: Execution
+Fixed a bug in Stage 2 writeResolveRecord function in which the string was dumped incorrectly in the resolve.bin due to size problem.
+Implemented the function for tokenizing lines of code, one-by-one. The function of building snapshot using the given callStack is also implemented. Then executeProgram function is implemented, along with some helper functions, that reads one line from resolve.bin, and according to the keyword, performs an action. It follows the correct logic of using callStack as functions are called in the program, and the actual arguments of a function frame are updated when another function that receives that modifies it (pass-by-reference type of behavior). After executing each line, this function builds a snapshot of the program and adds it into the timeline.
