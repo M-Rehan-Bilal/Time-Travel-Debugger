@@ -21,3 +21,6 @@ Implemented the function for tokenizing lines of code, one-by-one. The function 
 [October 10, 2026]
 Stage 4: Pass 0x3: Serialization
 Implemented the function of writeTdbg that basically writes all the snapshots from the timeline into the session.tdbg file. This function also writes the header of tdbg, step count, index offset which tells where the index start. Index are basically at the end of the file. Index[i] is basically the offset which tells where the snapshot[i] starts in the file. Since we know the index offset later at the end, we have to update the header too. Three helper functions are also implemented to remove the repeated work. Write Frame uses write string and variable to write the entire function frame in the tdbg file, and we dump every snapshot in the session.tdbg.
+
+[October 10, 2026]
+Implemented the Destructors for class Stack and Timeline.

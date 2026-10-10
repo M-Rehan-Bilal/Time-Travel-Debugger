@@ -92,6 +92,13 @@ public:
         }
         return i;
     }
+    ~Stack() {
+        while (top != nullptr) {
+            Node* temp = top;
+            top = top->next;
+            delete temp;
+        }
+    }
 };
 
 
@@ -127,6 +134,7 @@ public:
     int32_t getStepCount() {
         return stepCount;
     }
+    ~Timeline(); //implemented after the snapshot struct, because we have to delete snapshot as well.
 };
 
 // Core structs
@@ -146,6 +154,15 @@ struct Snapshot {
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
+
+Timeline::~Timeline() {
+    while (head != nullptr) {
+        TimelineNode* temp = head;
+        head = head->next;
+        delete temp->data;
+        delete temp;
+    }
+}
 
 // resolve.bin - bookkeeping
 struct FuncEntry {
