@@ -178,6 +178,24 @@ struct PendingPatch {
 bool readSourceLine(ifstream& in, string& out) {
     // reads the next nonblank line
     while (getline(in, out)) {
+        while (!out.empty() && (out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) // handling CRLF (end of line) issue on linux
+            out.pop_back();
+        // checking the entire string to remove extra spaces anywhere
+        bool space = false;
+        string corrected;
+        int size = out.size();
+        for (int i = 0; i < size; i++) {
+            if (out[i] == ' ' || out[i] == '\t') {
+                space = true;
+            }
+            else {
+                if (space && !corrected.empty())
+                    corrected += ' ';
+                corrected += out[i];
+                space = false;
+            }
+        }
+        out = corrected;
         if (!out.empty())
             return true;
     }
@@ -208,6 +226,8 @@ string secondWord(const string& line) {
             word += line[i];
         }
     }
+    if (!second) // second word not exists
+        return "";
     return word;
 }
 
@@ -621,6 +641,10 @@ int32_t main() {
     }
 
     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
+    if (mainOffset == -1) {
+        // main does not exist, so we send error
+        return 1;
+    }
 
     Timeline timeline;
     executeProgram("resolve.bin", mainOffset, timeline);

@@ -24,3 +24,6 @@ Implemented the function of writeTdbg that basically writes all the snapshots fr
 
 [October 10, 2026]
 Implemented the Destructors for class Stack and Timeline.
+
+[October 11, 2026]
+Fixed a bug in secondWord function so that it returns empty string if second word does not exist. Added support for linux for reading file because linux system characterize the end of line with LF (\n) only instead of CRLF (\r\n). Editted the readSourceLine function so that if the actual code contains random spaces, the program still works correctly by removing those spaces in this function.
