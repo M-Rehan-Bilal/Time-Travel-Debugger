@@ -27,3 +27,6 @@ Implemented the Destructors for class Stack and Timeline.
 
 [October 11, 2026]
 Fixed a bug in secondWord function so that it returns empty string if second word does not exist. Added support for linux for reading file because linux system characterize the end of line with LF (\n) only instead of CRLF (\r\n). Editted the readSourceLine function so that if the actual code contains random spaces, the program still works correctly by removing those spaces in this function.
+
+[October 12, 2026]
+Added files for the Project. Text.txt contains human readable sample code. Source.bin contains the sample code. Resolve.bin contains the resolved code version of that sample code. Session.tdbg is the file which mainly contains the snapshots that we return to the client.
