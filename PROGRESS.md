@@ -30,3 +30,13 @@ Fixed a bug in secondWord function so that it returns empty string if second wor
 
 [October 12, 2026]
 Added files for the Project. Text.txt contains human readable sample code. Source.bin contains the sample code. Resolve.bin contains the resolved code version of that sample code. Session.tdbg is the file which mainly contains the snapshots that we return to the client.
+
+[November 9, 2026]
+Phase 02: Load Balancer
+Implemented thhe Queue class using hand-written singly linked list which can store pending client sockets.
+Implemented the functions of sendAll, sendError, createListenSocket and connectToServer. All of these are socket helper functions.
+Implemented startServer which launches the server and connectToServerWithWakeup which connects to the server and starts it if it is down, retrying the connection up to 50 times.
+Implemented relayOneClient which forwards the client's data to the server and forwards the server's reply back to the client.
+Implemented the acceptLoop on its own thread which accepts the new clients and places them in queue. If the limit of pending clients is reached, and the new clients would get server busy, try again later error message.
+Implemented dispatcherLoop on the main thread which takes one client at a time from the queue under queueMutex and servers it fully before taking the next one.
+Implemented main which creates the listening socket, starts the accept thread and runs the dispatcher.
