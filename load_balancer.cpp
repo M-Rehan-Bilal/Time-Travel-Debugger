@@ -164,8 +164,8 @@ bool sendError(int sock, const string &message)
     {
         return false;
     }
-    int sum = checksumInit();
-    sum = checksumUpdate(sum, &status, 1);
+    Crc32 checksum;
+    checksum.update(&status, 1);
     if (message.size() > 0)
     {
         // 2. message
@@ -173,10 +173,11 @@ bool sendError(int sock, const string &message)
         {
             return false;
         }
-        sum = checksumUpdate(sum, message.data(), message.size());
+        checksum.update(message.data(), message.size());
     }
+    uint32_t cs = checksum.finish();
     // 3. checksum
-    return sendAll(sock, (const char *)&sum, sizeof(sum));
+    return sendAll(sock, (const char *)&cs, sizeof(cs));
 }
 int createListenSocket(int port)
 {
@@ -314,7 +315,7 @@ void relayOneClient(ClientInfo &c)
     char buffer[IO_BUFFER_SIZE];
     char lastFour[4];
     int lastCount = 0;
-    int checksum = checksumInit();
+    Crc32 checksum;
     bool valid = true;
 
     // Forward client request to server
@@ -332,7 +333,7 @@ void relayOneClient(ClientInfo &c)
         if (total > 4)
         {
             int dataCount = total - 4;
-            checksum = checksumUpdate(checksum, combined, dataCount);
+            checksum.update(combined, dataCount);
             if (!sendAll(serverSocket, combined, dataCount))
             {
                 valid = false;
@@ -349,15 +350,16 @@ void relayOneClient(ClientInfo &c)
                 lastFour[i] = combined[i];
         }
     }
+    uint32_t cs = checksum.finish();
 
     // Check the request checksum
     if (lastCount != 4)
         valid = false;
     else
     {
-        int receivedChecksum;
+        uint32_t receivedChecksum;
         memcpy(&receivedChecksum, lastFour, 4);
-        if (receivedChecksum != checksum)
+        if (receivedChecksum != cs)
             valid = false;
     }
 

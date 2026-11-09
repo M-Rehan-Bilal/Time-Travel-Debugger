@@ -11,9 +11,8 @@ const int32_t MAX_VARS_PER_FRAME = 16;
 const int32_t MAX_STACK_DEPTH = 64;
 
 // Reply and upload status bytes
-const char STATUS_OK = 0; // payload is the .tdbg file
+const char STATUS_OK = 0;    // payload is the .tdbg file
 const char STATUS_ERROR = 1; // payload is an error message
-
 
 struct FuncEntry
 {
@@ -53,21 +52,31 @@ struct TTDBHeader
     int64_t indexOffset;
 };
 
-// Checksum starts at 0
-int checksumInit()
+// CRC-32 checksum
+class Crc32
 {
-    return 0;
-}
-
-// Add the bytes to the running total
-int checksumUpdate(int total, const char *data, int n)
-{
-    for (int i = 0; i < n; i++)
+    uint32_t crc;
+public:
+    Crc32() : crc(0xFFFFFFFF) {}
+    void update(const char *data, size_t n)
     {
-        total += data[i];
+        for (size_t i = 0; i < n; i++)
+        {
+            crc ^= (uint8_t)data[i];
+            for (int bit = 0; bit < 8; bit++)
+            {
+                if (crc & 1)
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                else
+                    crc >>= 1;
+            }
+        }
     }
-    return total;
-}
+    uint32_t finish() const
+    {
+        return ~crc;
+    }
+};
 
 string firstWord(const string &line)
 {
@@ -126,11 +135,13 @@ string thirdWord(const string &line)
     }
     return word;
 }
-int countWords(const string& line) {
+int countWords(const string &line)
+{
     if (line.empty())
         return 0;
     int n = 1;
-    for (int i = 0; i < line.size(); i++) {
+    for (int i = 0; i < line.size(); i++)
+    {
         if (line[i] == ' ')
             n++;
     }

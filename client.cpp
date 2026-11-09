@@ -128,8 +128,8 @@ bool uploadSource(int sock, const char *sourcePath)
         return false;
 
     char status = 0;
-    int checksum = checksumInit();
-    checksum = checksumUpdate(checksum, &status, 1);
+    Crc32 checksum;
+    checksum.update(&status, 1);
     if (!sendAll(sock, &status, 1))
     {
         fclose(file);
@@ -140,7 +140,7 @@ bool uploadSource(int sock, const char *sourcePath)
     size_t amount = fread(buffer, 1, IO_BUFFER_SIZE, file);
     while (amount > 0)
     {
-        checksum = checksumUpdate(checksum, buffer, amount);
+        checksum.update(buffer, amount);
         if (!sendAll(sock, buffer, amount))
         {
             fclose(file);
@@ -148,6 +148,7 @@ bool uploadSource(int sock, const char *sourcePath)
         }
         amount = fread(buffer, 1, IO_BUFFER_SIZE, file);
     }
+    uint32_t cs = checksum.finish();
 
     if (ferror(file))
     {
@@ -157,7 +158,7 @@ bool uploadSource(int sock, const char *sourcePath)
 
     fclose(file);
 
-    if (!sendAll(sock, (const char *)&checksum, sizeof(checksum)))
+    if (!sendAll(sock, (const char *)&cs, sizeof(cs)))
     {
         return false;
     }
@@ -200,8 +201,8 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         }
     }
 
-    int checksum = checksumInit();
-    checksum = checksumUpdate(checksum, &status, 1);
+    Crc32 checksum;
+    checksum.update(&status, 1);
     char buffer[IO_BUFFER_SIZE];
     char lastFour[4];
     int count = 0;
@@ -226,7 +227,7 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
             }
             else
             {
-                checksum = checksumUpdate(checksum, lastFour, 1);
+                checksum.update(lastFour, 1);
                 if (status == 0)
                 {
                     if (fwrite(lastFour, 1, 1, file) != 1)
@@ -247,6 +248,7 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         if (failed)
             break;
     }
+    uint32_t cs = checksum.finish();
 
     if (file != nullptr)
         fclose(file);
@@ -256,9 +258,9 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         outError = "Connection error or incomplete response";
         return false;
     }
-    int receivedChecksum;
+    uint32_t receivedChecksum;
     memcpy(&receivedChecksum, lastFour, 4);
-    if (receivedChecksum != checksum)
+    if (receivedChecksum != cs)
     {
         remove(tempPath.c_str());
         outError = "checksum mismatch, response corrupted";

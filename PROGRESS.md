@@ -48,3 +48,7 @@ Implemented the uploadSource and receiveResponse, which stream the source file t
 Implemented the .tdbg reader and the local commands that work from the downloaded file.
 Implemented the runCommand and main, which parse the user input and run the debugger loop. Printing the snapshot is also implemented on the client side.
 Implemented helper.cpp file which contains the structs, functions and constants that are used in multiple files. Checksum is also implemented in this file.
+
+[November 9, 2026]
+Phase 02: Checksum Update
+Replaced the byte-sum checksum with CRC-32. Added a Crc32 class to helper.h that keeps its running value inside the object, with update() for each chunk and finish() called once at the end. Applied it in all the files so that its usage remains consistent.
