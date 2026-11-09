@@ -40,3 +40,11 @@ Implemented relayOneClient which forwards the client's data to the server and fo
 Implemented the acceptLoop on its own thread which accepts the new clients and places them in queue. If the limit of pending clients is reached, and the new clients would get server busy, try again later error message.
 Implemented dispatcherLoop on the main thread which takes one client at a time from the queue under queueMutex and servers it fully before taking the next one.
 Implemented main which creates the listening socket, starts the accept thread and runs the dispatcher.
+
+[November 9, 2026]
+Phase 02: Client Side & Helper file
+Implemented the client side of the project. The functions to receive and send data to the load balancer are implemented.
+Implemented the uploadSource and receiveResponse, which stream the source file to the load balancer and handle the [status][payload][checksum] reply.
+Implemented the .tdbg reader and the local commands that work from the downloaded file.
+Implemented the runCommand and main, which parse the user input and run the debugger loop. Printing the snapshot is also implemented on the client side.
+Implemented helper.cpp file which contains the structs, functions and constants that are used in multiple files. Checksum is also implemented in this file.

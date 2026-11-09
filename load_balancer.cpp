@@ -33,18 +33,22 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <cstring>
 #include "helper.h"
+#include <cerrno>
+#include <chrono>
+#include <ctime>
+#include <fcntl.h>
 using namespace std;
 
 // ---- Constants ----
 const char *SERVER_PATH = "./server";     // the program we start when the server is down
-const int IO_BUFFER_SIZE = 64 * 1024;     // fixed buffer for moving bytes
 const int LISTEN_BACKLOG = 16;            // connections the OS holds until accept() takes them
 const int MAX_PENDING_CLIENTS = 8;        // clients allowed to wait in our queue. More than this get "server busy".
 const int STARTUP_MAX_ATTEMPTS = 50;      // after starting the server, how many times we try to connect
 const int STARTUP_POLL_INTERVAL_MS = 100; // wait between those tries (50 x 100 ms = 5 seconds in total)
 int lbPort = 5000;
-string serverHost = "127.0.0.0";
+string serverHost = "127.0.0.1";
 int serverPort = 5001;
 
 // ---- Queue: here it holds client sockets (int). ----
@@ -127,7 +131,7 @@ struct ClientInfo
 // The queue is used by two threads, so every use of it must be inside queueMutex.
 Queue<ClientInfo> pendingClients;
 mutex queueMutex;
-sig_atomic_t flag = 1;
+volatile sig_atomic_t flag = 1;
 
 // ---- Basic socket helpers ----
 bool sendAll(int sock, const char *buf, size_t n)
@@ -138,14 +142,15 @@ bool sendAll(int sock, const char *buf, size_t n)
     while (sent < n)
     {
         ssize_t s = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
-        if (s > 0)
+        if (s < 0 && errno == EINTR)
         {
-            sent += s;
+            continue;
         }
-        else
+        if (s <= 0)
         {
             return false;
         }
+        sent += s;
     }
     return true;
 }
@@ -190,6 +195,7 @@ int createListenSocket(int port)
     if (setsockopt(welcomeSocket, SOL_SOCKET, SO_REUSEADDR, &allowed, sizeof(allowed)) == -1)
     {
         perror("setsockopt");
+        close(welcomeSocket);
         exit(1);
     }
 
@@ -201,11 +207,13 @@ int createListenSocket(int port)
     if (bind(welcomeSocket, (sockaddr *)&address, sizeof(address)) == -1)
     {
         perror("bind");
+        close(welcomeSocket);
         exit(1);
     }
     if (listen(welcomeSocket, LISTEN_BACKLOG) == -1)
     {
         perror("listen");
+        close(welcomeSocket);
         exit(1);
     }
     return welcomeSocket;
@@ -261,16 +269,17 @@ int connectToServerWithWakeup()
     // 3. Try connectToServer() up to STARTUP_MAX_ATTEMPTS times
     // 4. Return the first working socket, or -1 if the server never came up.
     int serverSocket = connectToServer(serverHost.c_str(), serverPort);
-    if (serverSocket != -1)
+    if (serverSocket != -1) // server is already running
     {
         return serverSocket;
     }
     if (!startServer(serverPort))
     {
-        return false;
+        return -1;
     }
     for (int i = 0; i < STARTUP_MAX_ATTEMPTS; i++)
     {
+        this_thread::sleep_for(chrono::milliseconds(STARTUP_POLL_INTERVAL_MS));
         serverSocket = connectToServer(serverHost.c_str(), serverPort);
         if (serverSocket != -1)
         {
@@ -295,36 +304,86 @@ void relayOneClient(ClientInfo &c)
     //    Stop when recv() returns 0 (the server sent its whole reply and closed) or fails.
     // 6. Close both sockets.
     int serverSocket = connectToServerWithWakeup();
-    if (serverSocket == -1)
+    if (serverSocket < 0)
     {
         sendError(c.sock, "backend server failed to start");
         close(c.sock);
         return;
     }
+
     char buffer[IO_BUFFER_SIZE];
-    ssize_t r;
-    bool uploaded = true;
-    while ((r = recv(c.sock, buffer, IO_BUFFER_SIZE, 0)) > 0)
+    char lastFour[4];
+    int lastCount = 0;
+    int checksum = checksumInit();
+    bool valid = true;
+
+    // Forward client request to server
+    while (true)
     {
-        if (!sendAll(serverSocket, buffer, r))
-        {
-            uploaded = false;
+        int bytes = recv(c.sock, buffer, IO_BUFFER_SIZE, 0);
+        if (bytes <= 0)
             break;
+        char combined[IO_BUFFER_SIZE + 4];
+        int total = 0;
+        for (int i = 0; i < lastCount; i++)
+            combined[total++] = lastFour[i];
+        for (int i = 0; i < bytes; i++)
+            combined[total++] = buffer[i];
+        if (total > 4)
+        {
+            int dataCount = total - 4;
+            checksum = checksumUpdate(checksum, combined, dataCount);
+            if (!sendAll(serverSocket, combined, dataCount))
+            {
+                valid = false;
+                break;
+            }
+            lastCount = 4;
+            for (int i = 0; i < 4; i++)
+                lastFour[i] = combined[dataCount + i];
+        }
+        else
+        {
+            lastCount = total;
+            for (int i = 0; i < total; i++)
+                lastFour[i] = combined[i];
         }
     }
+
+    // Check the request checksum
+    if (lastCount != 4)
+        valid = false;
+    else
+    {
+        int receivedChecksum;
+        memcpy(&receivedChecksum, lastFour, 4);
+        if (receivedChecksum != checksum)
+            valid = false;
+    }
+
+    if (valid)
+        sendAll(serverSocket, lastFour, 4); // forward the trailer only when the upload checksum is good
 
     shutdown(serverSocket, SHUT_WR);
 
-    if (uploaded)
+    if (!valid)
     {
-        while ((r = recv(serverSocket, buffer, IO_BUFFER_SIZE, 0)) > 0)
-        {
-            if (!sendAll(c.sock, buffer, r))
-            {
-                break;
-            }
-        }
+        sendError(c.sock, "checksum mismatch");
+        close(serverSocket);
+        close(c.sock);
+        return;
     }
+
+    // Forward server response to client
+    while (true)
+    {
+        int bytes = recv(serverSocket, buffer, IO_BUFFER_SIZE, 0);
+        if (bytes <= 0)
+            break;
+        if (!sendAll(c.sock, buffer, bytes))
+            break;
+    }
+
     close(serverSocket);
     close(c.sock);
 }
@@ -346,18 +405,38 @@ void acceptLoop(int listenSock)
     while (flag)
     {
         int clientSocket = accept(listenSock, nullptr, nullptr);
+
         if (clientSocket == -1)
         {
-            perror("accept");
+            if (errno == EINTR)
+                continue;
+
+            if (flag)
+                perror("accept");
+
             continue;
         }
+
+        int flags = fcntl(clientSocket, F_GETFD);
+
+        if (flags == -1 ||
+            fcntl(clientSocket, F_SETFD, flags | FD_CLOEXEC) == -1)
+        {
+            perror("fcntl");
+            close(clientSocket);
+            continue;
+        }
+
         ClientInfo client = {};
         client.sock = clientSocket;
         client.arrivedAt = time(nullptr);
+
         queueMutex.lock();
+
         if (pendingClients.size() >= MAX_PENDING_CLIENTS)
         {
             queueMutex.unlock();
+
             sendError(clientSocket, "server busy, try again later");
             close(clientSocket);
         }
@@ -389,6 +468,10 @@ void dispatcherLoop()
         {
             relayOneClient(client);
         }
+        else
+        {
+            this_thread::sleep_for(chrono::milliseconds(10));
+        }
     }
 }
 
@@ -400,16 +483,35 @@ void handler(int sg)
 int main(int argc, char *argv[])
 {
 
+    if (argc != 3)
+    {
+        cout << "Usage: ./load_balancer <server_ip> <server_port>" << endl;
+        return 1;
+    }
+
+    serverHost = argv[1];
+    serverPort = convertPortIntoInteger(argv[2]);
+
+    if (serverPort == -1)
+    {
+        cout << "Invalid Server Port" << endl;
+        return 1;
+    }
+
     signal(SIGINT, handler); // whenever ctrl+c will be pressed to exit the program the flag wll be set so insead of using infinite loop you can loop on flag to safely close things and exit
     // 2. listenSock = createListenSocket(LB_PORT).
     // 3. Start a thread that runs acceptLoop(listenSock) and detach it.
     // 4. Call dispatcherLoop().
+
+    signal(SIGPIPE, SIG_IGN);
 
     int listenSocket = createListenSocket(lbPort);
     thread acceptor(acceptLoop, listenSocket);
     acceptor.detach();
 
     dispatcherLoop();
+
+    close(listenSocket);
 
     return 0;
 }
