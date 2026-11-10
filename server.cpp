@@ -13,182 +13,187 @@
 #include <cstdint>
 #include <fstream>
 #include <vector>
-//#include <unistd.h>
-//#include <sys/socket.h>
-//#include <cstdint>
+#include <unistd.h>
+#include <sys/socket.h>
 #include <cstdio>
 #include <stdexcept>
+#include <cstring>
+#include <cerrno>
+#include <csignal>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include "helper.h"
 using namespace std;
 
 // ---- Constants ----
-const int32_t MAX_VARS_PER_FRAME = 16;
-const int32_t MAX_STACK_DEPTH = 64;
 const int32_t MAX_FUNCS = 128;
 const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2; // kW + func_name + upto 16 params/args
 const int32_t MAX_PATCHES = MAX_FUNCS * 4;
 const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
-const int32_t IO_BUFFER_SIZE = 64 * 1024; // fixed buffer for streaming to/from disk
 const int32_t SOCKET_TIMEOUT_SEC = 5; // TODO: apply as SO_RCVTIMEO so a deadclient can't hang the server forever
+const int32_t LISTEN_BACKLOG = 16;
 
 // ---- Custom data structures
 
 // Stack: back the live Call Stack during execution
 template <typename T>
-class Stack {
-    struct Node {
+class Stack
+{
+    struct Node
+    {
         T data;
-        Node* next;
+        Node *next;
     };
-    Node* top;
+    Node *top;
     int32_t count;
+
 public:
     // Implement these functions:
     Stack() : top(nullptr), count(0) {}
-    void push(const T& val) {
+    void push(const T &val)
+    {
         // pushes the value on the stack if max limit is not reached yet.
         if (count == MAX_STACK_DEPTH)
             throw overflow_error("Max Stack Depth Reached");
-        Node* temp = new Node{ val, nullptr };
-        if (count == 0) {
+        Node *temp = new Node{val, nullptr};
+        if (count == 0)
+        {
             top = temp;
         }
-        else {
+        else
+        {
             temp->next = top;
             top = temp;
         }
         count++;
     }
-    T pop() {
+    T pop()
+    {
         // pop the top value on the stack
         if (count == 0)
             throw underflow_error("Nothing to Pop from Stack");
-        Node* temp = top;
+        Node *temp = top;
         T val = top->data;
         top = top->next;
         delete temp;
         count--;
         return val;
     }
-    T& peek() {
+    T &peek()
+    {
         // returns the top value on the stack
         if (count == 0)
             throw underflow_error("Nothing to Peek from Stack");
         return top->data;
     }
-    bool isEmpty() {
+    bool isEmpty()
+    {
         return count == 0;
     }
-    int32_t depth() {
+    int32_t depth()
+    {
         return count;
     }
-    int32_t snapshot_into(T out[], int32_t maxLen) {
+    int32_t snapshot_into(T out[], int32_t maxLen)
+    {
         // copies every frame, top to bottom in the array given as a parameter
         // this is what buildSnapshot() call, returns count written
-        Node* temp = top;
+        Node *temp = top;
         int32_t i;
-        for (i = 0; i < maxLen && temp != nullptr; i++) {
+        for (i = 0; i < maxLen && temp != nullptr; i++)
+        {
             out[i] = temp->data;
             temp = temp->next;
         }
         return i;
     }
-    ~Stack() {
-        while (top != nullptr) {
-            Node* temp = top;
+    ~Stack()
+    {
+        while (top != nullptr)
+        {
+            Node *temp = top;
             top = top->next;
             delete temp;
         }
     }
 };
 
-
 // Timeline : doubly linked list of Snapshots
 struct Snapshot; // fwd declaration;
-struct TimelineNode {
-    Snapshot* data;
-    TimelineNode* next;
-    TimelineNode* prev;
+struct TimelineNode
+{
+    Snapshot *data;
+    TimelineNode *next;
+    TimelineNode *prev;
 };
-class Timeline {
-    TimelineNode* head, * tail;
+class Timeline
+{
+    TimelineNode *head, *tail;
     int32_t stepCount;
+
 public:
     // Implement these functions
     Timeline() : head(nullptr), tail(nullptr), stepCount(0) {}
-    void record(Snapshot* s) {
+    void record(Snapshot *s)
+    {
         // add record in the timeline
-        TimelineNode* temp = new TimelineNode{ s, nullptr, nullptr };
-        if (stepCount == 0) {
+        TimelineNode *temp = new TimelineNode{s, nullptr, nullptr};
+        if (stepCount == 0)
+        {
             head = tail = temp;
         }
-        else {
+        else
+        {
             tail->next = temp;
             temp->prev = tail;
             tail = temp;
         }
         stepCount++;
     }
-    TimelineNode* begin() {
+    TimelineNode *begin()
+    {
         return head;
     }
-    int32_t getStepCount() {
+    int32_t getStepCount()
+    {
         return stepCount;
     }
-    ~Timeline(); //implemented after the snapshot struct, because we have to delete snapshot as well.
+    ~Timeline(); // implemented after the snapshot struct, because we have to delete snapshot as well.
 };
 
-// Core structs
-struct Variable {
-    string name;
-    int32_t value;
-};
-struct Frame {
-    string func_name;
-    int32_t argc;
-    Variable argv[MAX_VARS_PER_FRAME];
-    int32_t returnLine;
-    Variable locals[MAX_VARS_PER_FRAME];
-    int32_t localCount;
-};
-struct Snapshot {
-    Frame callStack[MAX_STACK_DEPTH];
-    int32_t stackDepth;
-};
-
-Timeline::~Timeline() {
-    while (head != nullptr) {
-        TimelineNode* temp = head;
+Timeline::~Timeline()
+{
+    while (head != nullptr)
+    {
+        TimelineNode *temp = head;
         head = head->next;
         delete temp->data;
         delete temp;
     }
 }
 
-// resolve.bin - bookkeeping
-struct FuncEntry {
-    string funcName;
-    int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
-};
-struct PendingPatch {
-    int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
-    string targetFuncName;
-};
-
 // PASS 0x0: READING source.bin + VALIDITY CHECK
-bool readSourceLine(ifstream& in, string& out) {
+bool readSourceLine(ifstream &in, string &out)
+{
     // reads the next nonblank line
-    while (getline(in, out)) {
+    while (getline(in, out))
+    {
         while (!out.empty() && (out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) // handling CRLF (end of line) issue on linux
             out.pop_back();
         // checking the entire string to remove extra spaces anywhere
         bool space = false;
         string corrected;
         int size = out.size();
-        for (int i = 0; i < size; i++) {
-            if (out[i] == ' ' || out[i] == '\t') {
+        for (int i = 0; i < size; i++)
+        {
+            if (out[i] == ' ' || out[i] == '\t')
+            {
                 space = true;
             }
-            else {
+            else
+            {
                 if (space && !corrected.empty())
                     corrected += ' ';
                 corrected += out[i];
@@ -201,52 +206,13 @@ bool readSourceLine(ifstream& in, string& out) {
     }
     return false;
 }
-string firstWord(const string& line) {
-    // returns first word from the input string
-    string word = "";
-    for (int i = 0; i < line.size(); i++) {
-        if (line[i] == ' ')
-            break;
-        word += line[i];
-    }
-    return word;
-}
-string secondWord(const string& line) {
-    // returns the second word
-    string word = "";
-    bool second = false;
-    for (int i = 0; i < line.size(); i++) {
-        if (line[i] == ' ') {
-            if (second)
-                break;
-            second = true;
-            word = "";
-        }
-        else {
-            word += line[i];
-        }
-    }
-    if (!second) // second word not exists
-        return "";
-    return word;
-}
 
 const int INSTRUCTIONS_COUNT = 8;
-const string instructionSet[INSTRUCTIONS_COUNT] = { "func", "func_end", "call", "set", "add", "mul", "sub", "div" };
+const string instructionSet[INSTRUCTIONS_COUNT] = {"func", "func_end", "call", "set", "add", "mul", "sub", "div"};
 
-int countWords(const string& line) {
-    if (line.empty())
-        return 0;
-    int n = 1;
-    for (int i = 0; i < line.size(); i++) {
-        if (line[i] == ' ')
-            n++;
-    }
-    return n;
-}
-
-bool validateProgram(const char* sourcePath) {
-    // for each func defined there should be exactly one func_end and no nested funcs allowed - 
+bool validateProgram(const char *sourcePath)
+{
+    // for each func defined there should be exactly one func_end and no nested funcs allowed -
     ifstream rdr(sourcePath);
     if (!rdr)
         return false;
@@ -254,26 +220,31 @@ bool validateProgram(const char* sourcePath) {
     Stack<string> st;
     bool isValidKeyword = false;
     bool main = false;
-    while (readSourceLine(rdr, line)) {
+    while (readSourceLine(rdr, line))
+    {
         if (countWords(line) > MAX_TOKENS)
             return false; // too many parameters
         string fWord = firstWord(line);
         string sWord = secondWord(line);
-        if (fWord == "func") {
+        if (fWord == "func")
+        {
             if (sWord == "" || !st.isEmpty())
                 return false;
             st.push(fWord);
             if (sWord == "main")
                 main = true;
         }
-        else if (fWord == "func_end") {
+        else if (fWord == "func_end")
+        {
             if (st.isEmpty())
                 return false;
             st.pop();
         }
         isValidKeyword = false;
-        for (int i = 0; i < INSTRUCTIONS_COUNT; i++) {
-            if (fWord == instructionSet[i]) {
+        for (int i = 0; i < INSTRUCTIONS_COUNT; i++)
+        {
+            if (fWord == instructionSet[i])
+            {
                 isValidKeyword = true;
                 break;
             }
@@ -285,7 +256,8 @@ bool validateProgram(const char* sourcePath) {
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
-int64_t writeResolveRecord(FILE* f, int64_t offsetField, const string& text) {
+int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
+{
     // writes one [offset(8B)][size(4B)][string] record at the current file position
     // returns this record's own starting byte position
     int64_t startingBytePos = ftell(f);
@@ -296,26 +268,32 @@ int64_t writeResolveRecord(FILE* f, int64_t offsetField, const string& text) {
     return startingBytePos;
 }
 
-int64_t readResolveRecord(FILE* f, string& outText) {
+int64_t readResolveRecord(FILE *f, string &outText)
+{
     // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
     int64_t startingBytePos;
-    if (fread(&startingBytePos, sizeof(int64_t), 1, f) != 1) {
+    if (fread(&startingBytePos, sizeof(int64_t), 1, f) != 1)
+    {
         return -1;
     }
     int32_t size;
-    if (fread(&size, sizeof(int32_t), 1, f) != 1) {
+    if (fread(&size, sizeof(int32_t), 1, f) != 1)
+    {
         return -1;
     }
-    if (size <= 0 || size > IO_BUFFER_SIZE) {
+    if (size <= 0 || size > IO_BUFFER_SIZE)
+    {
         return -1; // corrupt size
     }
     outText.resize(size);
-    if (fread(&outText[0], size, 1, f) != 1) {
+    if (fread(&outText[0], size, 1, f) != 1)
+    {
         return -1;
     }
     return startingBytePos;
 }
-int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
+int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
+{
     FuncEntry funcArray[MAX_FUNCS];
     int32_t funcCount = 0;
     PendingPatch patches[MAX_PATCHES];
@@ -331,46 +309,56 @@ int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
     ifstream rdr(sourcePath);
     if (!rdr)
         return -1;
-    FILE* fout = fopen(resolveBinPath, "wb");
+    FILE *fout = fopen(resolveBinPath, "wb");
     if (!fout)
         return -1;
     string line;
     int64_t offset = 0;
-    while (readSourceLine(rdr, line)) {
+    while (readSourceLine(rdr, line))
+    {
         offset = writeResolveRecord(fout, offset, line);
         string fWord = firstWord(line);
         string sWord = secondWord(line);
-        if (fWord == "func") {
-            if (funcCount == MAX_FUNCS) {
+        if (fWord == "func")
+        {
+            if (funcCount == MAX_FUNCS)
+            {
                 fclose(fout);
                 rdr.close();
                 return -1;
             }
-            funcArray[funcCount] = { sWord, offset };
+            funcArray[funcCount] = {sWord, offset};
             funcCount++;
         }
-        else if (fWord == "call") {
-            if (patchCount == MAX_PATCHES) {
+        else if (fWord == "call")
+        {
+            if (patchCount == MAX_PATCHES)
+            {
                 fclose(fout);
                 rdr.close();
                 return -1;
             }
-            patches[patchCount] = { offset, sWord };
+            patches[patchCount] = {offset, sWord};
             patchCount++;
         }
         offset += sizeof(int64_t) + sizeof(int32_t) + line.size();
     }
-    for (int i = 0; i < patchCount; i++) {
+    for (int i = 0; i < patchCount; i++)
+    {
         bool found = false;
-        for (int j = 0; j < funcCount; j++) {
-            if (patches[i].targetFuncName == funcArray[j].funcName) {
+        for (int j = 0; j < funcCount; j++)
+        {
+            if (patches[i].targetFuncName == funcArray[j].funcName)
+            {
                 int64_t target = funcArray[j].byteOffsetInResolveBin;
-                if (fseek(fout, patches[i].byteOffsetOfOffsetField, SEEK_SET) != 0) {
+                if (fseek(fout, patches[i].byteOffsetOfOffsetField, SEEK_SET) != 0)
+                {
                     fclose(fout);
                     rdr.close();
                     return -1;
                 }
-                if (fwrite(&target, sizeof(int64_t), 1, fout) != 1) {
+                if (fwrite(&target, sizeof(int64_t), 1, fout) != 1)
+                {
                     fclose(fout);
                     rdr.close();
                     return -1;
@@ -379,7 +367,8 @@ int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
                 break;
             }
         }
-        if (!found) {
+        if (!found)
+        {
             fclose(fout);
             rdr.close();
             return -1;
@@ -387,8 +376,10 @@ int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
     }
     fclose(fout);
     rdr.close();
-    for (int i = 0; i < funcCount; i++) {
-        if (funcArray[i].funcName == "main") {
+    for (int i = 0; i < funcCount; i++)
+    {
+        if (funcArray[i].funcName == "main")
+        {
             return funcArray[i].byteOffsetInResolveBin;
         }
     }
@@ -396,16 +387,19 @@ int64_t resolveProgram(const char* sourcePath, const char* resolveBinPath) {
 }
 
 // PASS 0x2: EXECUTION (tokenization happens here)
-enum TokenType {
+enum TokenType
+{
     KEYWORD,
     IDENTIFIER,
     PARAM
 };
-struct Token {
+struct Token
+{
     TokenType type;
     string text;
 };
-int32_t tokenizeLine(const string& line, Token tokens[], int32_t maxTokens) {
+int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
+{
     // first word is always a instruction keyword
     // instruction set = [func, func_end, call, set, add, sub, mul and div]
     // next word is identifier like name of a function, variable name
@@ -413,105 +407,130 @@ int32_t tokenizeLine(const string& line, Token tokens[], int32_t maxTokens) {
     int32_t count = 0;
     string word;
     int size = line.size();
-    for (int i = 0; i < size; i++) {
-        if (line[i] != ' ') {
+    for (int i = 0; i < size; i++)
+    {
+        if (line[i] != ' ')
+        {
             word += line[i];
         }
-        if (line[i] == ' ' || i == size - 1) {
-            if (count == 0) {
-                tokens[count++] = { KEYWORD, word };
+        if (line[i] == ' ' || i == size - 1)
+        {
+            if (count == 0)
+            {
+                tokens[count++] = {KEYWORD, word};
             }
-            else if (count == 1) {
-                tokens[count++] = { IDENTIFIER, word };
+            else if (count == 1)
+            {
+                tokens[count++] = {IDENTIFIER, word};
             }
-            else {
-                tokens[count++] = { PARAM, word };
+            else
+            {
+                tokens[count++] = {PARAM, word};
             }
             word = "";
         }
     }
     return count;
 }
-Snapshot* buildSnapshot(Stack<Frame>& callStack) {
+Snapshot *buildSnapshot(Stack<Frame> &callStack)
+{
     // build the snapshot based on the callStack given
     if (callStack.isEmpty())
         return nullptr;
-    Snapshot* snapshot = new Snapshot();
+    Snapshot *snapshot = new Snapshot();
     snapshot->stackDepth = callStack.snapshot_into(snapshot->callStack, MAX_STACK_DEPTH);
     return snapshot;
 }
 
-void setVariable(Frame& funcFrame, const string& name, int32_t val) {
-    for (int i = 0; i < funcFrame.argc; i++) {
-        if (funcFrame.argv[i].name == name) {
+void setVariable(Frame &funcFrame, const string &name, int32_t val)
+{
+    for (int i = 0; i < funcFrame.argc; i++)
+    {
+        if (funcFrame.argv[i].name == name)
+        {
             funcFrame.argv[i].value = val;
             return;
         }
     }
-    for (int i = 0; i < funcFrame.localCount; i++) {
-        if (funcFrame.locals[i].name == name) {
+    for (int i = 0; i < funcFrame.localCount; i++)
+    {
+        if (funcFrame.locals[i].name == name)
+        {
             funcFrame.locals[i].value = val;
             return;
         }
     }
-    if (funcFrame.localCount < MAX_VARS_PER_FRAME) {
-        funcFrame.locals[funcFrame.localCount++] = { name, val };
+    if (funcFrame.localCount < MAX_VARS_PER_FRAME)
+    {
+        funcFrame.locals[funcFrame.localCount++] = {name, val};
     }
 }
-int32_t getValueOfVariable(Frame& funcFrame, const string& name) {
-    for (int i = 0; i < funcFrame.argc; i++) {
-        if (funcFrame.argv[i].name == name) {
+int32_t getValueOfVariable(Frame &funcFrame, const string &name)
+{
+    for (int i = 0; i < funcFrame.argc; i++)
+    {
+        if (funcFrame.argv[i].name == name)
+        {
             return funcFrame.argv[i].value;
         }
     }
-    for (int i = 0; i < funcFrame.localCount; i++) {
-        if (funcFrame.locals[i].name == name) {
+    for (int i = 0; i < funcFrame.localCount; i++)
+    {
+        if (funcFrame.locals[i].name == name)
+        {
             return funcFrame.locals[i].value;
         }
     }
     return stoi(name); // its a literal value
 }
 
-bool doesFuncHasVariableWithName(const Frame& funcFrame, string& name) {
-    for (int i = 0; i < funcFrame.argc; i++) {
+bool doesFuncHasVariableWithName(const Frame &funcFrame, string &name)
+{
+    for (int i = 0; i < funcFrame.argc; i++)
+    {
         if (funcFrame.argv[i].name == name)
             return true;
     }
-    for (int i = 0; i < funcFrame.localCount; i++) {
+    for (int i = 0; i < funcFrame.localCount; i++)
+    {
         if (funcFrame.locals[i].name == name)
             return true;
     }
     return false;
 }
 
-void executeProgram(const char* resolveBinPath, int64_t mainOffset, Timeline& timeline) {
+void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
+{
     // initialize the call stack
     // make the main frame
     // push main frame on the call stack
-    FILE* rdr = fopen(resolveBinPath, "rb");
+    FILE *rdr = fopen(resolveBinPath, "rb");
     Stack<Frame> callStack;
     string line;
     Token tokens[MAX_TOKENS];
     fseek(rdr, mainOffset, SEEK_SET);
     readResolveRecord(rdr, line); // to ignore the func main line
-    Frame funcFrame = { "main", 0, {}, -1, {}, 0 };
+    Frame funcFrame = {"main", 0, {}, -1, {}, 0};
     callStack.push(funcFrame);
     // implementation:
     // execute line by line, and according to the keyword perform action
     Stack<vector<string>> callerArgumentNames;
-    while (!callStack.isEmpty()) {
+    while (!callStack.isEmpty())
+    {
         int64_t offset = readResolveRecord(rdr, line);
         if (offset == -1)
             break;
         int32_t ct = tokenizeLine(line, tokens, MAX_TOKENS);
         string keyword = tokens[0].text;
-        Frame& currentFuncFrame = callStack.peek();
+        Frame &currentFuncFrame = callStack.peek();
 
-        if (keyword == "set") {
+        if (keyword == "set")
+        {
             int32_t val = getValueOfVariable(currentFuncFrame, tokens[2].text);
             setVariable(currentFuncFrame, tokens[1].text, val);
         }
-        else if (keyword == "add" || keyword == "sub" || keyword == "mul" || keyword == "div") {
+        else if (keyword == "add" || keyword == "sub" || keyword == "mul" || keyword == "div")
+        {
             int32_t a = getValueOfVariable(currentFuncFrame, tokens[1].text);
             int32_t b = getValueOfVariable(currentFuncFrame, tokens[2].text);
             int32_t result = 0;
@@ -521,14 +540,16 @@ void executeProgram(const char* resolveBinPath, int64_t mainOffset, Timeline& ti
                 result = a - b;
             else if (keyword == "mul")
                 result = a * b;
-            else if (keyword == "div") {
+            else if (keyword == "div")
+            {
                 if (b == 0)
                     throw runtime_error("Division by zero");
                 result = a / b;
             }
             setVariable(currentFuncFrame, tokens[1].text, result);
         }
-        else if (keyword == "call") {
+        else if (keyword == "call")
+        {
             int32_t returnPosition = ftell(rdr);
             Frame f = {};
             f.func_name = tokens[1].text;
@@ -538,49 +559,53 @@ void executeProgram(const char* resolveBinPath, int64_t mainOffset, Timeline& ti
             Token funcSignature[MAX_TOKENS];
             int32_t fCount = tokenizeLine(line, funcSignature, MAX_TOKENS);
             callerArgumentNames.push({});
-            for (int i = 2; i < fCount && i < ct; i++) { //fCount is number of params and ct is number of arguments (starting from index 2)
+            for (int i = 2; i < fCount && i < ct; i++)
+            { // fCount is number of params and ct is number of arguments (starting from index 2)
                 f.argv[f.argc].name = funcSignature[i].text;
                 f.argv[f.argc].value = getValueOfVariable(currentFuncFrame, tokens[i].text);
                 f.argc++;
-                if (doesFuncHasVariableWithName(currentFuncFrame, tokens[i].text)) {
+                if (doesFuncHasVariableWithName(currentFuncFrame, tokens[i].text))
+                {
                     callerArgumentNames.peek().push_back(tokens[i].text);
                 }
-                else {
+                else
+                {
                     callerArgumentNames.peek().push_back(""); // for literal values
                 }
             }
             callStack.push(f);
         }
-        else if (keyword == "func_end") {
+        else if (keyword == "func_end")
+        {
             Frame completed = callStack.pop();
-            if (callStack.isEmpty()) {
-                break; //nothing more to execute
+            if (callStack.isEmpty())
+            {
+                break; // nothing more to execute
             }
             fseek(rdr, completed.returnLine, SEEK_SET);
-            if (!callerArgumentNames.isEmpty()) {
-                for (int i = 0; i < callerArgumentNames.peek().size(); i++) {
-                    if (!callerArgumentNames.peek()[i].empty()) {
+            if (!callerArgumentNames.isEmpty())
+            {
+                for (int i = 0; i < callerArgumentNames.peek().size(); i++)
+                {
+                    if (!callerArgumentNames.peek()[i].empty())
+                    {
                         setVariable(callStack.peek(), callerArgumentNames.peek()[i], completed.argv[i].value);
                     }
                 }
                 callerArgumentNames.pop();
             }
         }
-        if (!callStack.isEmpty()) {
-            Snapshot* s = buildSnapshot(callStack);
+        if (!callStack.isEmpty())
+        {
+            Snapshot *s = buildSnapshot(callStack);
             timeline.record(s);
         }
     }
     fclose(rdr);
 }
 
-struct TTDBHeader {
-    char magic[4]; // "TTDB"
-    int32_t version;
-    int32_t stepCount;
-    int64_t indexOffset;
-};
-void writeHeader(FILE* f, const TTDBHeader& h) {
+void writeHeader(FILE *f, const TTDBHeader &h)
+{
     fwrite(h.magic, 1, 4, f);
     fwrite(&h.version, sizeof(int32_t), 1, f);
     // placeholder for other two data members
@@ -589,50 +614,57 @@ void writeHeader(FILE* f, const TTDBHeader& h) {
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
-void writeString(FILE* f, const string& s) {
+void writeString(FILE *f, const string &s)
+{
     int32_t size = s.size();
     fwrite(&size, sizeof(int32_t), 1, f);
     fwrite(&s[0], size, 1, f);
 }
-void writeVariable(FILE* f, const Variable& v) {
+void writeVariable(FILE *f, const Variable &v)
+{
     writeString(f, v.name);
     fwrite(&v.value, sizeof(int32_t), 1, f);
 }
-void writeFrame(FILE* f, const Frame& frame) {
+void writeFrame(FILE *f, const Frame &frame)
+{
     writeString(f, frame.func_name);
     fwrite(&frame.argc, sizeof(int32_t), 1, f);
-    for (int i = 0; i < frame.argc; i++) {
+    for (int i = 0; i < frame.argc; i++)
+    {
         writeVariable(f, frame.argv[i]);
     }
     fwrite(&frame.returnLine, sizeof(int32_t), 1, f);
     fwrite(&frame.localCount, sizeof(int32_t), 1, f);
-    for (int i = 0; i < frame.localCount; i++) {
+    for (int i = 0; i < frame.localCount; i++)
+    {
         writeVariable(f, frame.locals[i]);
     }
 }
-void writeTdbg(Timeline& timeline, const char* tdbgPath) {
+void writeTdbg(Timeline &timeline, const char *tdbgPath)
+{
     // placeholder for header
     // index array of the size of stepcount from the timeline
     // placing each snapshot in the file while maintaining the index(starting point of each nth snapshot)
     // after timeline add the index array in the file
     // update the header
-    FILE* f = fopen(tdbgPath, "wb");
+    FILE *f = fopen(tdbgPath, "wb");
     if (!f)
         return;
     int32_t steps = timeline.getStepCount();
-    TTDBHeader header = { {'T', 'T', 'D', 'B'}, 1, steps, 0 };
+    TTDBHeader header = {{'T', 'T', 'D', 'B'}, 1, steps, 0};
     writeHeader(f, header);
-    int64_t* index = nullptr;
+    int64_t *index = nullptr;
     if (steps > 0)
         index = new int64_t[steps];
     else
         index = new int64_t[1];
-    TimelineNode* node = timeline.begin();
+    TimelineNode *node = timeline.begin();
     int32_t i = 0;
-    while (node != nullptr) {
+    while (node != nullptr)
+    {
         index[i] = ftell(f);
         i++;
-        Snapshot* s = node->data;
+        Snapshot *s = node->data;
         fwrite(&s->stackDepth, sizeof(int32_t), 1, f);
         for (int depth = 0; depth < s->stackDepth; depth++)
             writeFrame(f, s->callStack[depth]);
@@ -646,26 +678,245 @@ void writeTdbg(Timeline& timeline, const char* tdbgPath) {
     fclose(f);
 }
 
+// <---------- PHASE 02 ---------->
 
+int createServerSocket(int port)
+{
+    int listenSock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listenSock == -1)
+    {
+        perror("socket");
+        exit(1);
+    }
+    int yes = 1;
+    if (setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1)
+    {
+        perror("setsockopt");
+        exit(1);
+    }
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(listenSock, (sockaddr *)&addr, sizeof(addr)) == -1)
+    {
+        perror("bind");
+        exit(1);
+    }
+    if (listen(listenSock, LISTEN_BACKLOG) == -1)
+    {
+        perror("listen");
+        exit(1);
+    }
+    return listenSock;
+}
 
-// main section
-int32_t main() {
+bool sendAll(int sock, const char *buf, size_t n)
+{
+    // send() may send fewer bytes than asked, so loop until all n are sent
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t s = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (s < 0 && errno == EINTR)
+            continue;
+        if (s <= 0)
+            return false;
+        sent += (size_t)s;
+    }
+    return true;
+}
 
-    if (!validateProgram("source.bin")) {
-        // send an error response instead of a .tdbg file
-        return 1;
+bool sendReply(int sock, char status, const string &payload)
+{
+    // Reply format: [status][payload][checksum]. The checksum covers status and payload.
+    Crc32 checksum;
+    checksum.update(&status, 1);
+    checksum.update(payload.data(), payload.size());
+    uint32_t cs = checksum.finish();
+    return sendAll(sock, &status, 1) &&
+           sendAll(sock, payload.data(), payload.size()) &&
+           sendAll(sock, (const char *)&cs, sizeof(cs));
+}
+
+bool readRequest(int sock, string &body, string &error)
+{
+    // Upload format: [status][body][checksum]. The load balancer closes its write
+    // side when the upload is finished, so recv() returns 0 at the end.
+    string all;
+    char buf[IO_BUFFER_SIZE];
+    while (true)
+    {
+        ssize_t r = recv(sock, buf, sizeof(buf), 0);
+        if (r == 0)
+            break;
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            error = "upload incomplete";
+            return false;
+        }
+        all.append(buf, (size_t)r);
+        if (all.size() > MAX_SOURCE_BYTES + 5)
+        {
+            error = "upload too large";
+            return false;
+        }
+    }
+
+    if (all.size() < 5)
+    {
+        error = "upload incomplete";
+        return false;
+    }
+
+    size_t covered = all.size() - 4; // status + body
+    uint32_t received;
+    memcpy(&received, all.data() + covered, sizeof(received));
+    
+    Crc32 checksum;
+    checksum.update(all.data(), covered);
+    uint32_t cs = checksum.finish();
+
+    if (cs != received || all[0] != STATUS_OK)
+    {
+        error = "upload checksum mismatch";
+        return false;
+    }
+
+    body = all.substr(1, covered - 1);
+    return true;
+}
+
+bool readWholeFile(const char *path, string &out)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == nullptr)
+        return false;
+    char buf[IO_BUFFER_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    bool ok = !ferror(f);
+    fclose(f);
+    return ok;
+}
+
+bool writeSourceFile(const string &body)
+{
+    FILE *f = fopen("source.bin", "wb");
+    if (f == nullptr)
+        return false;
+    size_t written = fwrite(body.data(), 1, body.size(), f);
+    bool ok = (written == body.size());
+    return fclose(f) == 0 && ok;
+}
+
+bool runPipeline(string &error)
+{
+    // runs the Phase 01 passes in order and writes session.tdbg
+    if (!validateProgram("source.bin"))
+    {
+        error = "invalid program: check func/func_end pairs, keywords, and that main exists";
+        return false;
     }
 
     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-    if (mainOffset == -1) {
-        // main does not exist, so we send error
-        return 1;
+    if (mainOffset == -1)
+    {
+        error = "resolve failed: call to an undefined function";
+        return false;
     }
 
     Timeline timeline;
-    executeProgram("resolve.bin", mainOffset, timeline);
+    try
+    {
+        executeProgram("resolve.bin", mainOffset, timeline);
+    }
+    catch (const exception &e)
+    {
+        error = string("runtime error: ") + e.what();
+        return false;
+    }
+
+    if (timeline.getStepCount() == 0)
+    {
+        error = "main has no statements to debug";
+        return false;
+    }
 
     writeTdbg(timeline, "session.tdbg");
+    struct stat st;
+    if (stat("session.tdbg", &st) != 0 || st.st_size == 0)
+    {
+        error = "server could not write session.tdbg";
+        return false;
+    }
+    return true;
+}
 
-    return 0;
+void handleRequest(int sock)
+{
+    string body;
+    string error;
+    if (!readRequest(sock, body, error))
+    {
+        sendReply(sock, STATUS_ERROR, error);
+        return;
+    }
+
+    remove("session.tdbg");
+    if (!writeSourceFile(body))
+    {
+        sendReply(sock, STATUS_ERROR, "server could not write source.bin");
+        return;
+    }
+
+    if (!runPipeline(error))
+    {
+        sendReply(sock, STATUS_ERROR, error);
+        return;
+    }
+
+    string tdbg;
+    if (!readWholeFile("session.tdbg", tdbg))
+    {
+        sendReply(sock, STATUS_ERROR, "server could not read session.tdbg");
+        return;
+    }
+    sendReply(sock, STATUS_OK, tdbg);
+}
+
+int main(int argc, char *argv[])
+{
+
+    if (argc != 2)
+    {
+        cout << "Usage: ./server <port>" << endl;
+        return 1;
+    }
+
+    int port = convertPortIntoInteger(argv[1]);
+    if (port == -1)
+    {
+        cout << "Invalid Port Number" << endl;
+        return 1;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+
+    int listenSocket = createServerSocket(port);
+    while(true) {
+        int client = accept(listenSocket, nullptr, nullptr);
+        if (client == -1)
+            continue;
+        
+        timeval timeout = {SOCKET_TIMEOUT_SEC, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        handleRequest(client);
+        close(client);
+    }
 }

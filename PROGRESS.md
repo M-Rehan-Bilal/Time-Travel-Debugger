@@ -52,3 +52,11 @@ Implemented helper.cpp file which contains the structs, functions and constants 
 [November 9, 2026]
 Phase 02: Checksum Update
 Replaced the byte-sum checksum with CRC-32. Added a Crc32 class to helper.h that keeps its running value inside the object, with update() for each chunk and finish() called once at the end. Applied it in all the files so that its usage remains consistent.
+
+[November 10, 2026]
+Phase 02: Server Side
+Implemented createServerSocket function which creates the listening socket and starts listening on the given port.
+Implemented sendAll and sendReply functions which send the reply as [status][payload][CRC-32]
+Implemented readRequest function which receives the upload from the load balancer, checks the upload checksum and can reject it if the checksum is wrong.
+Implemented readWholeFile and writeSourceFile which save the uploaded body to source.bin. The runPipeline function runs validation, resolve the program, execute it, serialize in order, and writes timeline in session.tdbg or returns specific error message at each stage that fails.
+Implemented handleRequest and main functions which accepts one client at a time, and send either the .tdbg file or the error message back.
