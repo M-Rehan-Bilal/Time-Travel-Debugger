@@ -37,6 +37,13 @@ const int MAX_JUMP = 1000000000;          // biggest n accepted by jmp
 string LB_HOST = "127.0.0.1";
 int LB_PORT = 5000;
 
+#include <sys/stat.h>
+
+const char *DOWNLOAD_FILE = "ttdb_download.tdbg"; // staging file: a new download lands here first
+const int32_t TDBG_VERSION = 1; // the version the server writes (move to helper.h if shared)
+const int64_t TDBG_HEADER_SIZE = 20; // magic(4) + version(4) + stepCount(4) + indexOffset(8)
+const int64_t INDEX_ENTRY_SIZE = 8; // one int64 offset per step
+
 // ---- Structs only the client needs ----
 struct TdbgReader
 {
@@ -277,6 +284,73 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
     return true;
 }
 
+// <.......................................................................................>
+
+// Reads n bytes at pos and moves pos forward. Never reads at or beyond limit.
+static bool readAt(int fd, int64_t &pos, int64_t limit, void *buf, size_t n)
+{
+    if (pos < 0 || (int64_t)n > limit - pos)
+        return false;
+    if (pread(fd, buf, n, pos) != (ssize_t)n)
+        return false;
+    pos += (int64_t)n;
+    return true;
+}
+
+// A string is stored as [int32 length][bytes].
+static bool readStr(int fd, int64_t &pos, int64_t limit, string &s)
+{
+    int32_t len = 0;
+    if (!readAt(fd, pos, limit, &len, sizeof(len)) || len < 0 || len > IO_BUFFER_SIZE)
+        return false;
+    s.resize(len);
+    return len == 0 || readAt(fd, pos, limit, &s[0], len);
+}
+
+// Parses one snapshot starting at pos into s. On return pos is just past it.
+// Layout (written by the server's writeTdbg):
+// [int32 stackDepth] then per frame: [string func_name][int32 argc]
+//   argc x ([string name][int32 value]) [int32 returnLine][int32 localCount]
+//   localCount x ([string name][int32 value])
+static bool parseSnapshot(int fd, int64_t &pos, int64_t limit, Snapshot &s)
+{
+    if (!readAt(fd, pos, limit, &s.stackDepth, sizeof(int32_t)) ||
+        s.stackDepth < 0 || s.stackDepth > MAX_STACK_DEPTH)
+        return false;
+
+    for (int i = 0; i < s.stackDepth; i++)
+    {
+        Frame &f = s.callStack[i];
+        if (!readStr(fd, pos, limit, f.func_name) ||
+            !readAt(fd, pos, limit, &f.argc, sizeof(int32_t)) ||
+            f.argc < 0 || f.argc > MAX_VARS_PER_FRAME)
+            return false;
+
+        for (int j = 0; j < f.argc; j++)
+        {
+            if (!readStr(fd, pos, limit, f.argv[j].name) ||
+                !readAt(fd, pos, limit, &f.argv[j].value, sizeof(int32_t)))
+                return false;
+        }
+
+        if (!readAt(fd, pos, limit, &f.returnLine, sizeof(int32_t)) ||
+            !readAt(fd, pos, limit, &f.localCount, sizeof(int32_t)) ||
+            f.localCount < 0 || f.localCount > MAX_VARS_PER_FRAME)
+            return false;
+
+        for (int j = 0; j < f.localCount; j++)
+        {
+            if (!readStr(fd, pos, limit, f.locals[j].name) ||
+                !readAt(fd, pos, limit, &f.locals[j].value, sizeof(int32_t)))
+                return false;
+        }
+    }
+    return true;
+}
+
+// <.......................................................................................>
+
+
 // =============================================================================================
 // PART B: READING THE .tdbg FILE
 // File layout (written by Phase 1):
@@ -286,28 +360,60 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
 bool openTdbg(const char *path, TdbgReader &r)
 {
     r.file_index = open(path, O_RDONLY);
+    r.index.clear();
     if (r.file_index == -1)
         return false;
 
-    bool ok =
-        pread(r.file_index, r.header.magic, 4, 0) == 4 &&
-        pread(r.file_index, &r.header.version, 4, 4) == 4 &&
-        pread(r.file_index, &r.header.stepCount, 4, 8) == 4 &&
-        pread(r.file_index, &r.header.indexOffset, 8, 12) == 8;
+    int fd = r.file_index;
+    struct stat st;
+    int64_t fileSize = (fstat(fd, &st) == 0) ? (int64_t)st.st_size : -1;
 
+    bool ok = fileSize >= TDBG_HEADER_SIZE;
     if (ok)
-        ok = memcmp(r.header.magic, "TTDB", 4) == 0 && r.header.stepCount > 0;
+    {
+        int64_t pos = 0;
+        ok = readAt(fd, pos, fileSize, r.header.magic, 4) &&
+             readAt(fd, pos, fileSize, &r.header.version, 4) &&
+             readAt(fd, pos, fileSize, &r.header.stepCount, 4) &&
+             readAt(fd, pos, fileSize, &r.header.indexOffset, 8);
+    }
+    if (ok)
+    {
+        ok = memcmp(r.header.magic, "TTDB", 4) == 0 &&
+             r.header.version == TDBG_VERSION &&
+             r.header.stepCount > 0 &&
+             r.header.indexOffset >= TDBG_HEADER_SIZE &&
+             r.header.indexOffset <= fileSize;
+    }
+    if (ok)
+    {
+        ok = (fileSize - r.header.indexOffset) == (int64_t)r.header.stepCount * INDEX_ENTRY_SIZE;
+    }
 
     if (ok)
     {
-        size_t indexBytes = (size_t)r.header.stepCount * 8;
         r.index.resize(r.header.stepCount);
-        ok = pread(r.file_index, r.index.data(), indexBytes, r.header.indexOffset) == (ssize_t)indexBytes;
+        size_t indexBytes = (size_t)r.header.stepCount * INDEX_ENTRY_SIZE;
+        ok = pread(fd, r.index.data(), indexBytes, r.header.indexOffset) == (ssize_t)indexBytes;
+    }
+
+    // Walk every snapshot in order. Each index entry must match where the previous snapshot ended.
+    if (ok)
+    {
+        Snapshot *scratch = new Snapshot;
+        int64_t pos = TDBG_HEADER_SIZE;
+        for (int32_t step = 0; ok && step < r.header.stepCount; step++)
+        {
+            ok = (r.index[step] == pos) &&
+                 parseSnapshot(fd, pos, r.header.indexOffset, *scratch);
+        }
+        ok = ok && (pos == r.header.indexOffset);
+        delete scratch;
     }
 
     if (!ok)
     {
-        close(r.file_index);
+        close(fd);
         r.file_index = -1;
         r.index.clear();
         return false;
@@ -330,63 +436,14 @@ void closeTdbg(TdbgReader &r)
 
 // <.......................................................................................>
 
-// Reads n bytes at pos and moves pos forward.
-static bool readAt(int fd, int64_t &pos, void *buf, size_t n)
-{
-    if (pread(fd, buf, n, pos) != (ssize_t)n)
-        return false;
-    pos += (int64_t)n;
-    return true;
-}
-
-// A string is stored as [int32 length][bytes].
-static bool readStr(int fd, int64_t &pos, string &s)
-{
-    int32_t len = 0;
-    if (!readAt(fd, pos, &len, sizeof(len)) || len < 0 || len > IO_BUFFER_SIZE)
-        return false;
-    s.resize(len);
-    return len == 0 || readAt(fd, pos, &s[0], len);
-}
-
-// Reads the snapshot for one step.
-// Layout (written by the server's writeTdbg):
-// [int32 stackDepth] then per frame: [string func_name][int32 argc]
-//   argc x ([string name][int32 value]) [int32 returnLine][int32 localCount]
-//   localCount x ([string name][int32 value])
 Snapshot *readSnapshotAt(TdbgReader &r, int32_t step)
 {
     if (r.file_index == -1 || step < 0 || step >= r.header.stepCount)
         return nullptr;
 
-    int fd = r.file_index;
     int64_t pos = r.index[step];
     Snapshot *s = new Snapshot;
-
-    bool ok = readAt(fd, pos, &s->stackDepth, sizeof(int32_t)) &&
-              s->stackDepth >= 0 && s->stackDepth <= MAX_STACK_DEPTH;
-
-    for (int i = 0; ok && i < s->stackDepth; i++)
-    {
-        Frame &f = s->callStack[i];
-        ok = readStr(fd, pos, f.func_name) &&
-             readAt(fd, pos, &f.argc, sizeof(int32_t)) &&
-             f.argc >= 0 && f.argc <= MAX_VARS_PER_FRAME;
-
-        for (int j = 0; ok && j < f.argc; j++)
-            ok = readStr(fd, pos, f.argv[j].name) &&
-                 readAt(fd, pos, &f.argv[j].value, sizeof(int32_t));
-
-        ok = ok && readAt(fd, pos, &f.returnLine, sizeof(int32_t)) &&
-             readAt(fd, pos, &f.localCount, sizeof(int32_t)) &&
-             f.localCount >= 0 && f.localCount <= MAX_VARS_PER_FRAME;
-
-        for (int j = 0; ok && j < f.localCount; j++)
-            ok = readStr(fd, pos, f.locals[j].name) &&
-                 readAt(fd, pos, &f.locals[j].value, sizeof(int32_t));
-    }
-
-    if (!ok)
+    if (!parseSnapshot(r.file_index, pos, r.header.indexOffset, *s))
     {
         delete s;
         return nullptr;
@@ -460,7 +517,7 @@ bool moveBy(DebugSession &s, int32_t delta)
     s.currentStep = target;
     return showCurrent(s);
 }
-bool requestDebugFile(const string &sourcePath, string &outError)
+bool requestDebugFile(const string &sourcePath, const char *downloadPath, string &outError)
 {
     int sock = connectToHost(LB_HOST.c_str(), LB_PORT);
     if (sock == -1)
@@ -474,7 +531,7 @@ bool requestDebugFile(const string &sourcePath, string &outError)
         outError = "Could not upload source file";
         return false;
     }
-    if (!receiveResponse(sock, TDBG_FILE, outError))
+    if (!receiveResponse(sock, downloadPath, outError))
     {
         close(sock);
         return false;
@@ -484,26 +541,36 @@ bool requestDebugFile(const string &sourcePath, string &outError)
 }
 bool cmdStart(DebugSession &s, const string &sourcePath)
 {
-    // 1. requestDebugFile with host and port, saving to TDBG_FILE.
-    // 2. If it fails, print the error text and return false. Keep the old session as it was.
-    // 3. Open the new file with openTdbg into a NEW local TdbgReader.
-    //    If that fails, print "server sent a damaged .tdbg file", keep the old session, return false.
-    // 4. Only now close the old reader (if s.active), then put the new reader into s,
-    //    set s.currentStep = 0 and s.active = true.
-    // 5. Show step 1 with showCurrent(s).
+    // 1. Download into the staging file. The saved session and the current session are untouched.
+    // 2. If the download fails, print the error and keep the old session.
+    // 3. Validate the staged file completely. If it is damaged, delete it, print the message,
+    //    and keep the old session.
+    // 4. Move the validated file over the saved session file. The open descriptor stays valid.
+    // 5. Only now replace the in-memory session and show step 1.
     string error;
-    if (!requestDebugFile(sourcePath, error))
+    if (!requestDebugFile(sourcePath, DOWNLOAD_FILE, error))
     {
         cout << error << endl;
         return false;
     }
+
     TdbgReader newReader = {};
     newReader.file_index = -1;
-    if (!openTdbg(TDBG_FILE, newReader))
+    if (!openTdbg(DOWNLOAD_FILE, newReader))
     {
-        cout << "Server sent a damaged .tdbg file" << endl;
+        remove(DOWNLOAD_FILE);
+        cout << "server sent a damaged .tdbg file" << endl;
         return false;
     }
+
+    if (rename(DOWNLOAD_FILE, TDBG_FILE) != 0)
+    {
+        closeTdbg(newReader);
+        remove(DOWNLOAD_FILE);
+        cout << "Could not save downloaded .tdbg file" << endl;
+        return false;
+    }
+
     if (s.active_flag)
     {
         closeTdbg(s.reader);
